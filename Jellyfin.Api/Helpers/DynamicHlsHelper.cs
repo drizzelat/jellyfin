@@ -329,6 +329,7 @@ public class DynamicHlsHelper
         var requestedMaxHeight = videoRequest.MaxHeight;
         var audioBitrate = state.OutputAudioBitrate ?? 0;
         var previousVideoBitrate = requestedVideoBitrate;
+        var rungs = new List<(int VideoBitrate, int BoxWidth, int BoxHeight)>();
 
         foreach (var (share, boxWidth, boxHeight, maxVideoBitrate) in _adaptiveBitrateRungs)
         {
@@ -341,6 +342,12 @@ public class DynamicHlsHelper
             }
 
             previousVideoBitrate = videoBitrate;
+            rungs.Add((videoBitrate, boxWidth, boxHeight));
+        }
+
+        for (var i = 0; i < rungs.Count; i++)
+        {
+            var (videoBitrate, boxWidth, boxHeight) = rungs[i];
 
             // Same sizing as the variant's own transcode (StreamingHelpers), so RESOLUTION tells the truth.
             var resolution = ResolutionNormalizer.Normalize(
@@ -366,6 +373,14 @@ public class DynamicHlsHelper
                 variantQuery["AudioBitrate"] = variantAudioBitrate.ToString(CultureInfo.InvariantCulture);
             }
 
+            // The lowest rung runs as a transcode of its own, so a client can keep it loaded next to the rung it plays
+            // without either job stopping the other. Its own device id keeps it out of the session's transcoding info.
+            if (i == rungs.Count - 1)
+            {
+                AddFloorSuffix(variantQuery, "PlaySessionId");
+                AddFloorSuffix(variantQuery, "DeviceId");
+            }
+
             var variantUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, variantQuery);
 
             videoRequest.MaxWidth = resolution.MaxWidth;
@@ -384,6 +399,14 @@ public class DynamicHlsHelper
             else
             {
                 query.Remove(key);
+            }
+        }
+
+        static void AddFloorSuffix(Dictionary<string, StringValues> query, string key)
+        {
+            if (query.TryGetValue(key, out var value) && !StringValues.IsNullOrEmpty(value))
+            {
+                query[key] = $"{value}-floor";
             }
         }
     }
