@@ -580,11 +580,6 @@ public class DynamicHlsHelper
             return false;
         }
 
-        if (EncodingHelper.IsCopyCodec(state.OutputAudioCodec))
-        {
-            return false;
-        }
-
         if (!state.IsOutputVideo)
         {
             return false;

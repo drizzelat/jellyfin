@@ -1525,12 +1525,24 @@ public class DynamicHlsController : BaseJellyfinApiController
                 // If the playlist doesn't already exist, startup ffmpeg
                 try
                 {
+                    // An adaptive bitrate switch stops the job of the variant the client left.
+                    var otherVariantJob = streamingRequest.PlaySessionId is null ? null : _transcodeManager.GetTranscodingJob(streamingRequest.PlaySessionId);
+                    var otherVariantWasRunning = otherVariantJob is not null && otherVariantJob.Type == TranscodingJobType && !otherVariantJob.HasExited;
+
                     await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
                         .ConfigureAwait(false);
 
                     if (currentTranscodingIndex.HasValue)
                     {
                         await DeleteLastFile(playlistPath, segmentExtension, 0).ConfigureAwait(false);
+                    }
+
+                    // Its last segment was cut short when it stopped, so a switch back must encode it again.
+                    if (otherVariantWasRunning
+                        && otherVariantJob!.Path is not null
+                        && !string.Equals(otherVariantJob.Path, playlistPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await DeleteLastFile(otherVariantJob.Path, segmentExtension, 0).ConfigureAwait(false);
                     }
 
                     streamingRequest.StartTimeTicks = streamingRequest.CurrentRuntimeTicks;

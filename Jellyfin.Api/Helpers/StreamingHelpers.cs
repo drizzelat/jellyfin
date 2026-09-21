@@ -373,7 +373,8 @@ public static class StreamingHelpers
     /// <returns>The complete file path, including the folder, for the transcoding file.</returns>
     private static string GetOutputFilePath(StreamState state, string outputFileExtension, IServerConfigurationManager serverConfigurationManager, string? deviceId, string? playSessionId)
     {
-        var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}";
+        // Adaptive bitrate variants share a play session; the requested bitrate keeps their segments apart.
+        var data = $"{state.MediaPath}-{state.UserAgent}-{deviceId!}-{playSessionId!}-{state.BaseRequest.VideoBitRate}";
 
         var filename = data.GetMD5().ToString("N", CultureInfo.InvariantCulture);
         var ext = outputFileExtension.ToLowerInvariant();
