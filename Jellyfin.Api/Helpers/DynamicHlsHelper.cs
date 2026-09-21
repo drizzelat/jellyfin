@@ -25,6 +25,7 @@ using MediaBrowser.Model.Net;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 
 namespace Jellyfin.Api.Helpers;
@@ -44,6 +45,14 @@ public class DynamicHlsHelper
     private readonly ILogger<DynamicHlsHelper> _logger;
     private readonly IHttpContextAccessor _httpContextAccessor;
     private readonly EncodingHelper _encodingHelper;
+
+    // Lower adaptive bitrate rungs: share of the requested video bitrate, the box it is scaled into, and its bitrate cap.
+    private static readonly (double Share, int Width, int Height, int MaxBitrate)[] _adaptiveBitrateRungs =
+    [
+        (0.5, 1280, 720, 4000000),
+        (0.25, 960, 540, 2000000),
+        (0.125, 640, 360, 1000000)
+    ];
     private readonly ITrickplayManager _trickplayManager;
 
     /// <summary>
@@ -295,22 +304,7 @@ public class DynamicHlsHelper
 
         if (EnableAdaptiveBitrateStreaming(state, isLiveStream, enableAdaptiveBitrateStreaming, _httpContextAccessor.HttpContext.GetNormalizedRemoteIP()))
         {
-            var requestedVideoBitrate = state.VideoRequest?.VideoBitRate ?? 0;
-
-            // By default, vary by just 200k
-            var variation = GetBitrateVariation(totalBitrate);
-
-            var newBitrate = totalBitrate - variation;
-            var variantQuery = playlistQuery;
-            variantQuery["VideoBitrate"] = (requestedVideoBitrate - variation).ToString(CultureInfo.InvariantCulture);
-            var variantUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, variantQuery);
-            AppendPlaylist(builder, state, variantUrl, newBitrate, subtitleGroup);
-
-            variation *= 2;
-            newBitrate = totalBitrate - variation;
-            variantQuery["VideoBitrate"] = (requestedVideoBitrate - variation).ToString(CultureInfo.InvariantCulture);
-            variantUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, variantQuery);
-            AppendPlaylist(builder, state, variantUrl, newBitrate, subtitleGroup);
+            AppendAdaptiveBitrateVariants(builder, state, playlistQuery, baseUrl, subtitleGroup);
         }
 
         if (!isLiveStream && (state.VideoRequest?.EnableTrickplay ?? false))
@@ -321,6 +315,77 @@ public class DynamicHlsHelper
         }
 
         return new FileContentResult(Encoding.UTF8.GetBytes(builder.ToString()), MimeTypes.GetMimeType("playlist.m3u8"));
+    }
+
+    /// <summary>
+    /// Appends the lower rungs of the adaptive bitrate ladder below the requested stream.
+    /// Each rung gets a share of the requested video bitrate, capped for a smaller box it is scaled into.
+    /// </summary>
+    private void AppendAdaptiveBitrateVariants(StringBuilder builder, StreamState state, Dictionary<string, StringValues> playlistQuery, string baseUrl, string? subtitleGroup)
+    {
+        var videoRequest = state.VideoRequest!;
+        var requestedVideoBitrate = videoRequest.VideoBitRate!.Value;
+        var requestedMaxWidth = videoRequest.MaxWidth;
+        var requestedMaxHeight = videoRequest.MaxHeight;
+        var audioBitrate = state.OutputAudioBitrate ?? 0;
+        var previousVideoBitrate = requestedVideoBitrate;
+
+        foreach (var (share, boxWidth, boxHeight, maxVideoBitrate) in _adaptiveBitrateRungs)
+        {
+            var videoBitrate = Math.Min((int)(requestedVideoBitrate * share), maxVideoBitrate);
+
+            // A rung must save a real share of the bandwidth to be worth an encoder restart.
+            if (videoBitrate > previousVideoBitrate * 0.75 || videoBitrate < 250000)
+            {
+                continue;
+            }
+
+            previousVideoBitrate = videoBitrate;
+
+            // Same sizing as the variant's own transcode (StreamingHelpers), so RESOLUTION tells the truth.
+            var resolution = ResolutionNormalizer.Normalize(
+                state.VideoStream?.BitRate,
+                videoBitrate,
+                EncodingHelper.ScaleBitrate(videoBitrate, state.ActualOutputVideoCodec, "h264"),
+                Math.Min(boxWidth, requestedMaxWidth ?? boxWidth),
+                Math.Min(boxHeight, requestedMaxHeight ?? boxHeight),
+                state.TargetFramerate);
+
+            var variantQuery = new Dictionary<string, StringValues>(playlistQuery, StringComparer.OrdinalIgnoreCase)
+            {
+                ["VideoBitrate"] = videoBitrate.ToString(CultureInfo.InvariantCulture)
+            };
+            SetOrRemove(variantQuery, "MaxWidth", resolution.MaxWidth);
+            SetOrRemove(variantQuery, "MaxHeight", resolution.MaxHeight);
+
+            // Transcoded audio is a large part of a low rung; copied audio stays untouched.
+            var variantAudioBitrate = audioBitrate;
+            if (videoBitrate < 1500000 && audioBitrate > 128000 && !EncodingHelper.IsCopyCodec(state.OutputAudioCodec))
+            {
+                variantAudioBitrate = 128000;
+                variantQuery["AudioBitrate"] = variantAudioBitrate.ToString(CultureInfo.InvariantCulture);
+            }
+
+            var variantUrl = Microsoft.AspNetCore.WebUtilities.QueryHelpers.AddQueryString(baseUrl, variantQuery);
+
+            videoRequest.MaxWidth = resolution.MaxWidth;
+            videoRequest.MaxHeight = resolution.MaxHeight;
+            AppendPlaylist(builder, state, variantUrl, videoBitrate + variantAudioBitrate, subtitleGroup);
+            videoRequest.MaxWidth = requestedMaxWidth;
+            videoRequest.MaxHeight = requestedMaxHeight;
+        }
+
+        static void SetOrRemove(Dictionary<string, StringValues> query, string key, int? value)
+        {
+            if (value.HasValue)
+            {
+                query[key] = value.Value.ToString(CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                query.Remove(key);
+            }
+        }
     }
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
@@ -850,43 +915,6 @@ public class DynamicHlsHelper
         }
 
         return string.Empty;
-    }
-
-    private int GetBitrateVariation(int bitrate)
-    {
-        // By default, vary by just 50k
-        var variation = 50000;
-
-        if (bitrate >= 10000000)
-        {
-            variation = 2000000;
-        }
-        else if (bitrate >= 5000000)
-        {
-            variation = 1500000;
-        }
-        else if (bitrate >= 3000000)
-        {
-            variation = 1000000;
-        }
-        else if (bitrate >= 2000000)
-        {
-            variation = 500000;
-        }
-        else if (bitrate >= 1000000)
-        {
-            variation = 300000;
-        }
-        else if (bitrate >= 600000)
-        {
-            variation = 200000;
-        }
-        else if (bitrate >= 400000)
-        {
-            variation = 100000;
-        }
-
-        return variation;
     }
 
     private string ReplacePlaylistCodecsField(StringBuilder playlist, StringBuilder oldValue, StringBuilder newValue)
