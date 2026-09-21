@@ -1455,11 +1455,13 @@ public class DynamicHlsController : BaseJellyfinApiController
 
         var segmentExtension = EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer);
 
+        var isInitSegment = segmentId == -1;
+
         // Keep segment selection and transcoding replacement under the same playlist lock.
         // An out-of-order request must not replace a job while another request is using its output.
+        TranscodingJob? job;
         using (await _transcodeManager.LockAsync(playlistPath, cancellationToken).ConfigureAwait(false))
         {
-            TranscodingJob? job;
             var startTranscoding = false;
             if (System.IO.File.Exists(segmentPath))
             {
@@ -1473,8 +1475,14 @@ public class DynamicHlsController : BaseJellyfinApiController
 
             if (segmentId == -1)
             {
-                _logger.LogDebug("Starting transcoding because fmp4 init file is being requested");
-                startTranscoding = true;
+                // A job already running for this playlist writes the init segment too, whatever position it started at.
+                var runningJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
+                startTranscoding = runningJob is null || runningJob.HasExited;
+                if (startTranscoding)
+                {
+                    _logger.LogDebug("Starting transcoding because fmp4 init file is being requested");
+                }
+
                 segmentId = 0;
             }
             else if (currentTranscodingIndex is null)
@@ -1549,10 +1557,17 @@ public class DynamicHlsController : BaseJellyfinApiController
                 }
             }
 
-            _logger.LogDebug("returning {0} [general case]", segmentPath);
             job ??= _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
-            return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
+            if (!isInitSegment)
+            {
+                _logger.LogDebug("returning {0} [general case]", segmentPath);
+                return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
+            }
         }
+
+        // Outside the playlist lock, so a media request can restart the job while this waits.
+        _logger.LogDebug("returning {0} [init segment]", segmentPath);
+        return await GetInitSegmentResult(state, playlistPath, segmentPath, segmentExtension, job).ConfigureAwait(false);
     }
 
     internal static async Task WaitForActiveTranscodingRequests(TranscodingJob? job, CancellationToken cancellationToken)
@@ -1561,6 +1576,36 @@ public class DynamicHlsController : BaseJellyfinApiController
         {
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Waits for the fMP4 init segment. A media segment request far ahead can restart the job while this waits,
+    /// and whichever job runs for the playlist writes the same init segment, so the wait does not follow one job.
+    /// </summary>
+    private async Task<ActionResult> GetInitSegmentResult(
+        StreamState state,
+        string playlistPath,
+        string initSegmentPath,
+        string segmentExtension,
+        TranscodingJob? transcodingJob)
+    {
+        for (var waited = 0; waited < 30000; waited += 100)
+        {
+            // ffmpeg writes the init segment just before it closes the first media segment.
+            var lastFile = GetLastTranscodingFile(playlistPath, segmentExtension, _fileSystem);
+            if (lastFile is not null
+                && System.IO.File.Exists(initSegmentPath)
+                && !string.Equals(lastFile.FullName, initSegmentPath, StringComparison.OrdinalIgnoreCase)
+                && lastFile.LastWriteTimeUtc >= System.IO.File.GetLastWriteTimeUtc(initSegmentPath))
+            {
+                return GetSegmentResult(state, initSegmentPath, -1, transcodingJob);
+            }
+
+            await Task.Delay(100, HttpContext.RequestAborted).ConfigureAwait(false);
+        }
+
+        _logger.LogWarning("cannot serve {0} as no transcode wrote it in time", initSegmentPath);
+        return NotFound();
     }
 
     private static double[] GetSegmentLengths(StreamState state)
