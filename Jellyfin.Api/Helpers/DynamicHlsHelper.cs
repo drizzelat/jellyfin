@@ -318,8 +318,9 @@ public class DynamicHlsHelper
     }
 
     /// <summary>
-    /// Appends the lower rungs of the adaptive bitrate ladder below the requested stream.
-    /// Each rung gets a share of the requested video bitrate, capped for a smaller box it is scaled into.
+    /// Appends the rungs of the adaptive bitrate ladder around the requested stream.
+    /// Lower rungs take a share of the requested video bitrate in a smaller box; upper rungs double it up to
+    /// what the source and the remote client limit allow, so a stream started on a bad link can climb again.
     /// </summary>
     private void AppendAdaptiveBitrateVariants(StringBuilder builder, StreamState state, Dictionary<string, StringValues> playlistQuery, string baseUrl, string? subtitleGroup)
     {
@@ -329,7 +330,30 @@ public class DynamicHlsHelper
         var requestedMaxHeight = videoRequest.MaxHeight;
         var audioBitrate = state.OutputAudioBitrate ?? 0;
         var previousVideoBitrate = requestedVideoBitrate;
-        var rungs = new List<(int VideoBitrate, int BoxWidth, int BoxHeight)>();
+        var rungs = new List<(int VideoBitrate, int? BoxWidth, int? BoxHeight)>();
+
+        // Rungs above the request. The client measured the connection once, at playback start; a link that gets
+        // better later can carry what a stream started on it would have got. Their box is the client's own limit:
+        // the request's has been narrowed to the requested bitrate already (StreamingHelpers).
+        var ceiling = GetAdaptiveBitrateCeiling(state, audioBitrate);
+        var clientMaxWidth = GetQueryInt(playlistQuery, "MaxWidth");
+        var clientMaxHeight = GetQueryInt(playlistQuery, "MaxHeight");
+        var upperRungs = new List<int>();
+        for (var videoBitrate = (long)requestedVideoBitrate * 2; videoBitrate <= ceiling; videoBitrate *= 2)
+        {
+            upperRungs.Add((int)videoBitrate);
+        }
+
+        // The ceiling itself, where the last doubling left a real gap below it.
+        if (ceiling > (upperRungs.Count > 0 ? upperRungs[^1] : requestedVideoBitrate) * 1.33)
+        {
+            upperRungs.Add(ceiling);
+        }
+
+        for (var i = upperRungs.Count - 1; i >= 0; i--)
+        {
+            rungs.Add((upperRungs[i], clientMaxWidth, clientMaxHeight));
+        }
 
         foreach (var (share, boxWidth, boxHeight, maxVideoBitrate) in _adaptiveBitrateRungs)
         {
@@ -342,8 +366,12 @@ public class DynamicHlsHelper
             }
 
             previousVideoBitrate = videoBitrate;
-            rungs.Add((videoBitrate, boxWidth, boxHeight));
+            rungs.Add((videoBitrate, Math.Min(boxWidth, requestedMaxWidth ?? boxWidth), Math.Min(boxHeight, requestedMaxHeight ?? boxHeight)));
         }
+
+        // The upper rungs came first, from the highest down, so the list runs down to the lowest rung. Without a rung
+        // below the request there is no floor rung: the lowest level of the ladder is then the stream playing itself.
+        var floorRung = rungs.Count > 0 && rungs[^1].VideoBitrate < requestedVideoBitrate ? rungs.Count - 1 : -1;
 
         for (var i = 0; i < rungs.Count; i++)
         {
@@ -354,8 +382,8 @@ public class DynamicHlsHelper
                 state.VideoStream?.BitRate,
                 videoBitrate,
                 EncodingHelper.ScaleBitrate(videoBitrate, state.ActualOutputVideoCodec, "h264"),
-                Math.Min(boxWidth, requestedMaxWidth ?? boxWidth),
-                Math.Min(boxHeight, requestedMaxHeight ?? boxHeight),
+                boxWidth,
+                boxHeight,
                 state.TargetFramerate);
 
             var variantQuery = new Dictionary<string, StringValues>(playlistQuery, StringComparer.OrdinalIgnoreCase)
@@ -375,7 +403,7 @@ public class DynamicHlsHelper
 
             // The lowest rung runs as a transcode of its own, so a client can keep it loaded next to the rung it plays
             // without either job stopping the other. Its own device id keeps it out of the session's transcoding info.
-            if (i == rungs.Count - 1)
+            if (i == floorRung)
             {
                 AddFloorSuffix(variantQuery, "PlaySessionId");
                 AddFloorSuffix(variantQuery, "DeviceId");
@@ -409,6 +437,40 @@ public class DynamicHlsHelper
                 query[key] = $"{value}-floor";
             }
         }
+
+        static int? GetQueryInt(Dictionary<string, StringValues> query, string key)
+        {
+            return query.TryGetValue(key, out var value)
+                && int.TryParse(value.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+                    ? parsed
+                    : null;
+        }
+    }
+
+    /// <summary>
+    /// The highest video bitrate a rung of the adaptive bitrate ladder may ask for: what the source carries,
+    /// within the limit set for remote clients. The ladder only ever runs for remote clients.
+    /// </summary>
+    private int GetAdaptiveBitrateCeiling(StreamState state, int audioBitrate)
+    {
+        var remoteClientBitrateLimit = state.User?.RemoteClientBitrateLimit ?? 0;
+        if (remoteClientBitrateLimit <= 0)
+        {
+            remoteClientBitrateLimit = _serverConfigurationManager.Configuration.RemoteClientBitrateLimit;
+        }
+
+        var ceiling = remoteClientBitrateLimit > 0 ? remoteClientBitrateLimit - audioBitrate : int.MaxValue;
+
+        // A rung above what the source carries only costs encoder time. Stay below it as well: a variant asking for
+        // the source bitrate is stream-copied instead of transcoded, and a copy cuts its segments on the source's
+        // own keyframes rather than on the ladder's grid, so a switch to it would not be gapless.
+        var sourceVideoBitrate = state.VideoStream?.BitRate;
+        if (sourceVideoBitrate > 0)
+        {
+            ceiling = Math.Min(ceiling, (int)(EncodingHelper.ScaleBitrate(sourceVideoBitrate.Value, state.VideoStream!.Codec, state.ActualOutputVideoCodec) * 0.9));
+        }
+
+        return ceiling;
     }
 
     private StringBuilder AppendPlaylist(StringBuilder builder, StreamState state, string url, int bitrate, string? subtitleGroup)
