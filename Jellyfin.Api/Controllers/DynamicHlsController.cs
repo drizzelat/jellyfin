@@ -1405,6 +1405,33 @@ public class DynamicHlsController : BaseJellyfinApiController
             .ConfigureAwait(false);
     }
 
+    private static int GetSegmentLengthMs(StreamState state)
+    {
+        double fps = state.TargetFramerate ?? 0.0f;
+        int segmentLength = state.SegmentLength * 1000;
+
+        // If video is transcoded and framerate is fractional (i.e. 23.976), we need to slightly adjust segment length
+        if (!EncodingHelper.IsCopyCodec(state.OutputVideoCodec) && Math.Abs(fps - Math.Floor(fps + 0.001f)) > 0.001)
+        {
+            double nearestIntFramerate = Math.Ceiling(fps);
+            segmentLength = (int)Math.Ceiling(segmentLength * (nearestIntFramerate / fps));
+        }
+
+        return segmentLength;
+    }
+
+    /// <summary>
+    /// Whether a transcode for an adaptive bitrate rung starts one segment early and exactly on the segment grid.
+    /// Every transcode of every rung then places its keyframes and audio frames at the same instants, so a rung
+    /// switch joins two of them without a gap, and the AAC encoder delay falls into the extra segment.
+    /// </summary>
+    private bool IsAlignedAdaptiveBitrateStart(StreamState state, int segmentId)
+        => segmentId > 0
+           && state.IsOutputVideo
+           && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+           && string.Equals(state.Request.SegmentContainer, "mp4", StringComparison.OrdinalIgnoreCase)
+           && string.Equals(Request.Query["EnableAdaptiveBitrateStreaming"], "true", StringComparison.OrdinalIgnoreCase);
+
     private async Task<ActionResult> GetVariantPlaylistInternal(StreamingRequestDto streamingRequest, CancellationTokenSource cancellationTokenSource)
     {
         using var state = await StreamingHelpers.GetStreamingState(
@@ -1421,15 +1448,7 @@ public class DynamicHlsController : BaseJellyfinApiController
                 cancellationTokenSource.Token)
             .ConfigureAwait(false);
         var mediaSourceId = state.BaseRequest.MediaSourceId;
-        double fps = state.TargetFramerate ?? 0.0f;
-        int segmentLength = state.SegmentLength * 1000;
-
-        // If video is transcoded and framerate is fractional (i.e. 23.976), we need to slightly adjust segment length
-        if (!EncodingHelper.IsCopyCodec(state.OutputVideoCodec) && Math.Abs(fps - Math.Floor(fps + 0.001f)) > 0.001)
-        {
-            double nearestIntFramerate = Math.Ceiling(fps);
-            segmentLength = (int)Math.Ceiling(segmentLength * (nearestIntFramerate / fps));
-        }
+        var segmentLength = GetSegmentLengthMs(state);
 
         var request = new CreateMainPlaylistRequest(
             mediaSourceId is null ? null : Guid.Parse(mediaSourceId),
@@ -1553,13 +1572,16 @@ public class DynamicHlsController : BaseJellyfinApiController
                         await DeleteLastFile(otherVariantJob.Path, segmentExtension, 0).ConfigureAwait(false);
                     }
 
-                    streamingRequest.StartTimeTicks = streamingRequest.CurrentRuntimeTicks;
+                    var alignedStart = IsAlignedAdaptiveBitrateStart(state, segmentId);
+                    streamingRequest.StartTimeTicks = alignedStart
+                        ? streamingRequest.CurrentRuntimeTicks - (GetSegmentLengthMs(state) * TimeSpan.TicksPerMillisecond)
+                        : streamingRequest.CurrentRuntimeTicks;
 
                     state.WaitForPath = segmentPath;
                     job = await _transcodeManager.StartFfMpeg(
                         state,
                         playlistPath,
-                        GetCommandLineArguments(playlistPath, state, false, segmentId),
+                        GetCommandLineArguments(playlistPath, state, false, alignedStart ? segmentId - 1 : segmentId, alignedStart),
                         Request.HttpContext.User.GetUserId(),
                         TranscodingJobType,
                         cancellationTokenSource).ConfigureAwait(false);
@@ -1646,7 +1668,7 @@ public class DynamicHlsController : BaseJellyfinApiController
         return segments;
     }
 
-    private string GetCommandLineArguments(string outputPath, StreamState state, bool isEventPlaylist, int startNumber)
+    private string GetCommandLineArguments(string outputPath, StreamState state, bool isEventPlaylist, int startNumber, bool alignedStart = false)
     {
         var videoCodec = _encodingHelper.GetVideoEncoder(state, _encodingOptions);
         var threads = EncodingHelper.GetNumberOfThreads(state, _encodingOptions, videoCodec);
@@ -1672,6 +1694,14 @@ public class DynamicHlsController : BaseJellyfinApiController
         var segmentFormat = string.Empty;
         var segmentContainer = outputExtension.TrimStart('.');
         var inputModifier = _encodingHelper.GetInputModifier(state, _encodingOptions, segmentContainer);
+        var inputArgument = _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer);
+        if (alignedStart)
+        {
+            // An exact seek, so the first frame is the one on the segment grid, not the keyframe before it.
+            inputModifier = inputModifier.Replace(" -noaccurate_seek", string.Empty, StringComparison.Ordinal);
+            inputArgument = inputArgument.Replace(" -noaccurate_seek", string.Empty, StringComparison.Ordinal);
+        }
+
         var hlsArguments = $"-hls_playlist_type {(isEventPlaylist ? "event" : "vod")} -hls_list_size 0";
 
         if (string.Equals(segmentContainer, "ts", StringComparison.OrdinalIgnoreCase))
@@ -1721,11 +1751,11 @@ public class DynamicHlsController : BaseJellyfinApiController
             CultureInfo.InvariantCulture,
             "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts disabled -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
             inputModifier,
-            _encodingHelper.GetInputArgument(state, _encodingOptions, segmentContainer),
+            inputArgument,
             threads,
             mapArgs,
             GetVideoArguments(state, startNumber, isEventPlaylist, segmentContainer),
-            GetAudioArguments(state),
+            GetAudioArguments(state, alignedStart),
             maxMuxingQueueSize,
             state.SegmentLength.ToString(CultureInfo.InvariantCulture),
             segmentFormat,
@@ -1740,8 +1770,9 @@ public class DynamicHlsController : BaseJellyfinApiController
     /// Gets the audio arguments for transcoding.
     /// </summary>
     /// <param name="state">The <see cref="StreamState"/>.</param>
+    /// <param name="alignedStart">Whether the transcode starts on the segment grid for an adaptive bitrate rung.</param>
     /// <returns>The command line arguments for audio transcoding.</returns>
-    private string GetAudioArguments(StreamState state)
+    private string GetAudioArguments(StreamState state, bool alignedStart = false)
     {
         if (state.AudioStream is null)
         {
@@ -1857,7 +1888,20 @@ public class DynamicHlsController : BaseJellyfinApiController
             args += " -ar 48000";
         }
 
-        args += _encodingHelper.GetAudioFilterParam(state, _encodingOptions);
+        var audioFilterParam = _encodingHelper.GetAudioFilterParam(state, _encodingOptions);
+        if (alignedStart && string.Equals(state.OutputAudioCodec, "aac", StringComparison.OrdinalIgnoreCase))
+        {
+            // Start on the 1024-sample AAC frame grid, so every transcode cuts its segments' audio at the same samples.
+            var sampleRate = state.OutputAudioSampleRate ?? state.AudioStream?.SampleRate ?? 48000;
+            var start = TimeSpan.FromTicks(state.BaseRequest.StartTimeTicks ?? 0).TotalSeconds;
+            var gridStart = Math.Ceiling(start * sampleRate / 1024) * 1024 / sampleRate;
+            var trim = "atrim=start=" + gridStart.ToString("0.#########", CultureInfo.InvariantCulture);
+            audioFilterParam = string.IsNullOrEmpty(audioFilterParam)
+                ? " -af \"" + trim + "\""
+                : audioFilterParam.Replace(" -af \"", " -af \"" + trim + ",", StringComparison.Ordinal);
+        }
+
+        args += audioFilterParam;
 
         return args;
     }
