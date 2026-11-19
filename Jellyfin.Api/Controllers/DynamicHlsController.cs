@@ -1611,23 +1611,45 @@ public class DynamicHlsController : BaseJellyfinApiController
         string segmentExtension,
         TranscodingJob? transcodingJob)
     {
-        for (var waited = 0; waited < 30000; waited += 100)
+        try
         {
-            // ffmpeg writes the init segment just before it closes the first media segment.
-            var lastFile = GetLastTranscodingFile(playlistPath, segmentExtension, _fileSystem);
-            if (lastFile is not null
-                && System.IO.File.Exists(initSegmentPath)
-                && !string.Equals(lastFile.FullName, initSegmentPath, StringComparison.OrdinalIgnoreCase)
-                && lastFile.LastWriteTimeUtc >= System.IO.File.GetLastWriteTimeUtc(initSegmentPath))
+            for (var waited = 0; waited < 30000; waited += 100)
             {
-                return GetSegmentResult(state, initSegmentPath, -1, transcodingJob);
-            }
+                // ffmpeg writes the init segment just before it closes the first media segment.
+                var lastFile = GetLastTranscodingFile(playlistPath, segmentExtension, _fileSystem);
+                if (lastFile is not null
+                    && System.IO.File.Exists(initSegmentPath)
+                    && !string.Equals(lastFile.FullName, initSegmentPath, StringComparison.OrdinalIgnoreCase)
+                    && lastFile.LastWriteTimeUtc >= System.IO.File.GetLastWriteTimeUtc(initSegmentPath))
+                {
+                    return GetSegmentResult(state, initSegmentPath, -1, transcodingJob);
+                }
 
-            await Task.Delay(100, HttpContext.RequestAborted).ConfigureAwait(false);
+                await Task.Delay(100, HttpContext.RequestAborted).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            ReleaseRequest(transcodingJob);
+            throw;
         }
 
         _logger.LogWarning("cannot serve {0} as no transcode wrote it in time", initSegmentPath);
+        ReleaseRequest(transcodingJob);
         return NotFound();
+    }
+
+    /// <summary>
+    /// Ends this request's count on its transcoding job when it ends without a segment served, which is what ends it
+    /// otherwise. A count left behind stops the job from ever being replaced: a seek or adaptive bitrate switch to
+    /// its playlist waits on <see cref="WaitForActiveTranscodingRequests"/>, holding the playlist lock, for good.
+    /// </summary>
+    private void ReleaseRequest(TranscodingJob? transcodingJob)
+    {
+        if (transcodingJob is not null)
+        {
+            _transcodeManager.OnTranscodeEndRequest(transcodingJob);
+        }
     }
 
     private static double[] GetSegmentLengths(StreamState state)
@@ -2075,7 +2097,15 @@ public class DynamicHlsController : BaseJellyfinApiController
                     }
                 }
 
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    ReleaseRequest(transcodingJob);
+                    throw;
+                }
             }
 
             if (!System.IO.File.Exists(segmentPath))
@@ -2087,7 +2117,11 @@ public class DynamicHlsController : BaseJellyfinApiController
                 _logger.LogDebug("serving {0} as it's on disk and transcoding stopped", segmentPath);
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                ReleaseRequest(transcodingJob);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
         }
         else
         {
